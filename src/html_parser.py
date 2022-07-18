@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from html import unescape
 from typing import TYPE_CHECKING, Optional, cast
 
 import aiohttp
-import bs4
 
 import consts
 
@@ -16,28 +16,21 @@ if TYPE_CHECKING:
 class Parser(ABC):
     def __init__(self) -> None:
         self.session: Optional[aiohttp.ClientSession] = None
-        self.soup: Optional[bs4.BeautifulSoup] = None
 
     def set_session(self, session: aiohttp.ClientSession) -> None:
         self.session = session
 
-    async def get_html(self, url: str) -> str:
+    async def get_html(self, num: int) -> str:
         if isinstance(self.session, aiohttp.ClientSession):
-            html: aiohttp.ClientResponse = await self.session.get(url)
+            html: aiohttp.ClientResponse = await self.session.get(self.get_url(num))
 
-        return await html.text()
-
-    async def soup_page(self, num: int) -> bs4.BeautifulSoup:
-        return bs4.BeautifulSoup(
-            await self.get_html(self.get_url(num)), features="lxml"
-        )
+        return unescape(await html.text())
 
     async def get_item(self, num: int) -> tuple[int, Item]:
-        self.soup = await self.soup_page(num)
-        return self.create_item(num)
+        return await self.create_item(num)
 
     @abstractmethod
-    def create_item(self, num: int) -> tuple[int, Item]:
+    async def create_item(self, num: int) -> tuple[int, Item]:
         ...
 
     @abstractmethod
@@ -54,39 +47,26 @@ class ListParser(Parser):
         return f"{self.url}{num}"
 
     async def get_page(self, num: int) -> list[int]:
-        nums: list[int] = []
-        pattern: re.Pattern[str] = re.compile(r"/([0-9]+)/")
+        pattern: re.Pattern[str] = re.compile(
+            r'<div class=".+" data-item="allstars/card" data-item-id="([0-9]+)">'
+        )
 
-        page: bs4.BeautifulSoup = await self.soup_page(num)
-        items: bs4.ResultSet[bs4.Tag] = page.find_all(class_="top-item")
-
-        for item in items:
-            if (
-                isinstance(item, bs4.Tag)
-                and isinstance(found := item.find("a"), bs4.Tag)
-                and isinstance(string := found.get("href"), str)
-                and isinstance(match := pattern.search(string), re.Match)
-            ):
-                group: str = match.group(1)
-                nums.append(int(group))
+        page: str = await self.get_html(num)
+        nums: list[int] = [int(num) for num in pattern.findall(page)]
 
         return sorted(nums, reverse=True)
 
     async def get_num_pages(self) -> int:
-        pattern: re.Pattern[str] = re.compile(r"=([0-9]+)")
+        pattern: re.Pattern[str] = re.compile(
+            r'<a href="/allstars/cards/\?page=([0-9]+)">[0-9]+</a>'
+        )
 
-        page: bs4.BeautifulSoup = await self.soup_page(1)
-        if (
-            isinstance(item := page.find(class_="pagination"), bs4.Tag)
-            and isinstance(links := item.find_all("a"), bs4.ResultSet)
-            and isinstance(string := links[-2].get("href"), str)
-            and isinstance(match := pattern.search(string), re.Match)
-        ):
-            group: str = match.group(1)
+        page: str = await self.get_html(1)
+        num: str = pattern.findall(page)[-1]
 
-        return int(group)
+        return int(num)
 
-    def create_item(self, num: int) -> tuple[int, Item]:
+    async def create_item(self, num: int) -> tuple[int, Item]:
         ...
 
 
@@ -94,8 +74,10 @@ class CardParser(Parser):
     def get_url(self, num: int) -> str:
         return f"{consts.CARD_URL_TEMPLATE}{num}"
 
-    def create_item(self, num: int) -> tuple[int, Card]:
+    async def create_item(self, num: int) -> tuple[int, Card]:
         from classes import Card
+
+        self.html = await self.get_html(num)
 
         urls: tuple[str, str] = self.get_item_image_urls()
 
@@ -111,61 +93,58 @@ class CardParser(Parser):
         )
         return num, new_card
 
-    def update_item(self, card: Card) -> None:
-        card.normal_url, card.idolized_url = self.get_item_image_urls()
-
     def get_item_image_urls(self) -> tuple[str, str]:
-        if (
-            isinstance(self.soup, bs4.BeautifulSoup)
-            and isinstance(top_item := self.soup.find(class_="top-item"), bs4.Tag)
-            and isinstance(links := top_item.find_all("a"), bs4.ResultSet)
-            and isinstance(first := links[0].get("href"), str)
-            and isinstance(second := links[1].get("href"), str)
-        ):
-            urls: tuple[str, str] = (first, second)
-        return urls
+        pattern: re.Pattern[str] = re.compile(
+            r'<a href="(//i.idol.st/u/card/art/.+?)" target="_blank">'
+        )
 
-    def get_data_field(self, field: str) -> bs4.Tag:
+        all_urls: list[str] = pattern.findall(self.html)
 
-        if (
-            isinstance(self.soup, bs4.BeautifulSoup)
-            and isinstance(data := self.soup.find(attrs={"data-field": field}), bs4.Tag)
-            and isinstance(res := data.find_all("td")[1], bs4.Tag)
-        ):
-            pass
-        return cast(bs4.Tag, res)
+        return all_urls[0], all_urls[1]
+
+    def get_data_field(self, field: str) -> str:
+
+        match: re.Match[str] = cast(
+            re.Match[str],
+            re.search(
+                f'<tr data-field="{field}" class="">(.+?)</tr>', self.html, re.DOTALL
+            ),
+        )
+        return match.group(0)
 
     def get_item_info(self, info: str) -> str:
         if info == "idol":
-            data: bs4.Tag = self.get_data_field("idol")
+            data: str = self.get_data_field("idol")
+            pattern: re.Pattern[str] = re.compile(
+                r'<span class="text_with_link">(.+?)<br>'
+            )
+            match: re.Match[str] = cast(re.Match[str], pattern.search(data))
+            return match.group(1)
 
-            if isinstance(found_data := data.find("span"), bs4.Tag):
-                return found_data.get_text().partition("Open idol")[0].strip()
-
-        return self.get_data_field(info).get_text().strip()
+        data = self.get_data_field(info)
+        match = cast(re.Match[str], re.findall(r"<td>(.+?)</td>", data, re.DOTALL))
+        return match[-1].strip()
 
 
 class StillParser(Parser):
     def get_url(self, num: int) -> str:
         return f"{consts.STILL_URL_TEMPLATE}{num}"
 
-    def create_item(self, num: int) -> tuple[int, Still]:
+    async def create_item(self, num: int) -> tuple[int, Still]:
         from classes import Still
+
+        self.html = await self.get_html(num)
 
         url: str = self.get_item_image_url()
 
         new_item: Still = Still(num, url)
         return num, new_item
 
-    def update_item(self, item: Still) -> None:
-        item.url = self.get_item_image_url()
-
     def get_item_image_url(self) -> str:
-        if (
-            isinstance(self.soup, bs4.BeautifulSoup)
-            and isinstance(top_item := self.soup.find(class_="top-item"), bs4.Tag)
-            and isinstance(links := top_item.find_all("a"), bs4.Tag)
-        ):
-            link: str = links[0].get("href")
+        pattern: re.Pattern[str] = re.compile(
+            r'<a href="(//i.idol.st/u/card/art/.+?)" target="_blank">'
+        )
 
-        return link
+        all_urls: list[str] = pattern.findall(self.html)
+
+        return all_urls[0]
